@@ -1,6 +1,8 @@
-<?php namespace PhpImap;
+<?php namespace StghPhpImap;
 
+use stghHtml2Text\Html2Text;
 use stdClass;
+use StgHelpdesk\Helpers\Stg_Helper_Logger;
 
 /**
  * @see https://github.com/barbushin/php-imap
@@ -16,6 +18,7 @@ class Mailbox {
 	protected $imapParams = array();
 	protected $serverEncoding;
 	protected $attachmentsDir;
+	protected $expungeOnDisconnect = true;
 
 	public function __construct($imapPath, $login, $password, $attachmentsDir = null, $serverEncoding = 'UTF-8') {
 		$this->imapPath = $imapPath;
@@ -63,8 +66,10 @@ class Mailbox {
 
 	protected function initImapStream() {
 		$imapStream = @imap_open($this->imapPath, $this->imapLogin, $this->imapPassword, $this->imapOptions, $this->imapRetriesNum, $this->imapParams);
+		$errors = imap_errors();
+		imap_alerts();
 		if(!$imapStream) {
-			throw new Exception('Connection error: ' . imap_last_error());
+			throw new Exception('Connection error: ' . reset($errors));
 		}
 		return $imapStream;
 	}
@@ -72,8 +77,16 @@ class Mailbox {
 	protected function disconnect() {
 		$imapStream = $this->getImapStream(false);
 		if($imapStream && is_resource($imapStream)) {
-			imap_close($imapStream, CL_EXPUNGE);
+			imap_close($imapStream, $this->expungeOnDisconnect ? CL_EXPUNGE : 0);
 		}
+	}
+
+	/**
+	 * Sets 'expunge on disconnect' parameter
+	 * @param bool $isEnabled
+	 */
+	public function setExpungeOnDisconnect($isEnabled) {
+		$this->expungeOnDisconnect = $isEnabled;
 	}
 
 	/**
@@ -130,7 +143,7 @@ class Mailbox {
 		foreach ($folders as $key => $folder)
 		{
 			$folder = str_replace($this->imapPath, "", imap_utf7_decode($folder));
-			$folders[ $key  ] = $folder;
+			$folders[$key] = $folder;
 		}
 		return $folders;
 	}
@@ -171,7 +184,9 @@ class Mailbox {
 	 * @return array Mails ids
 	 */
 	public function searchMailbox($criteria = 'ALL') {
-		$mailsIds = imap_search($this->getImapStream(), $criteria, SE_UID, $this->serverEncoding);
+		//Remove $this->serverEncoding for office365 bug
+		//$mailsIds = imap_search($this->getImapStream(), $criteria, SE_UID, $this->serverEncoding);
+		$mailsIds = imap_search($this->getImapStream(), $criteria, SE_UID);
 		return $mailsIds ? $mailsIds : array();
 	}
 
@@ -304,7 +319,7 @@ class Mailbox {
 			foreach($mails as &$mail)
 			{
 				if(isset($mail->subject)) {
-					$mail->subject = $this->decodeMimeStr($mail->subject, $this->serverEncoding);
+                    $mail->subject = $this->decodeMimeStr($mail->subject, $this->serverEncoding);
 				}
 				if(isset($mail->from)) {
 					$mail->from = $this->decodeMimeStr($mail->from, $this->serverEncoding);
@@ -316,6 +331,10 @@ class Mailbox {
 		}
 		return $mails;
 	}
+
+    protected function simpleConvertStringEncoding($from, $to, $string){
+        return @iconv($from, $to, $string);
+    }
 
 	/**
 	 * Get information about the current mailbox.
@@ -397,21 +416,39 @@ class Mailbox {
 		return $quota;
 	}
 
-	/**
-	 * Get mail data
-	 *
-	 * @param $mailId
-	 * @return IncomingMail
-	 */
-	public function getMail($mailId) {
+    /**
+     * Get mail data
+     *
+     * @param $mailId
+     * @param bool $markAsSeen
+     * @return IncomingMail
+     */
+	public function getMail($mailId, $markAsSeen = true)
+	{
 		$head = imap_rfc822_parse_headers(imap_fetchheader($this->getImapStream(), $mailId, FT_UID));
+
+		$rowHead = imap_fetchheader($this->getImapStream(), $mailId, FT_UID);
+
+		foreach (explode("\r\n", $rowHead) as $row)
+		{
+			$tmp = explode(":",$row);
+
+			if(count($tmp)>1)
+				$rowHeadArray[trim(strtolower($tmp[0]))] = trim(strtolower($tmp[1]));
+		}
 
 		$mail = new IncomingMail();
 		$mail->id = $mailId;
-		$mail->date = date('Y-m-d H:i:s', isset($head->date) ? strtotime($head->date) : time());
-		$mail->subject = isset($head->subject) ? $this->decodeMimeStr($head->subject, $this->serverEncoding) : null;
-		$mail->fromName = isset($head->from[0]->personal) ? $this->decodeMimeStr($head->from[0]->personal, $this->serverEncoding) : null;
+		$mail->date = date('Y-m-d H:i:s', isset($head->date) ? strtotime(preg_replace('/\(.*?\)/', '', $head->date)) : time());
+        $mail->subject = isset($head->subject) ? $this->decodeMimeStr($head->subject, $this->serverEncoding) : null;
+        $mail->fromName = isset($head->from[0]->personal) ? $this->decodeMimeStr($head->from[0]->personal, $this->serverEncoding) : null;
 		$mail->fromAddress = strtolower($head->from[0]->mailbox . '@' . $head->from[0]->host);
+
+		$mail->xAutoreply = isset($rowHeadArray['x-autoreply']) ? $rowHeadArray['x-autoreply']:null;
+		$mail->xAutoResponseSuppress = isset($rowHeadArray['x-auto-response-suppress']) ? $rowHeadArray['z-auto-response-suppress']:null;;
+		$mail->autoSubmitted = isset($rowHeadArray['auto-submitted']) ? $rowHeadArray['auto-submitted']:null;;
+
+
 
 		if(isset($head->to)) {
 			$toStrings = array();
@@ -438,34 +475,47 @@ class Mailbox {
 			}
 		}
 
+		if(isset($head->message_id)) {
+			$mail->messageId = $head->message_id;
+		}
+
 		$mailStructure = imap_fetchstructure($this->getImapStream(), $mailId, FT_UID);
 
 		if(empty($mailStructure->parts)) {
-			$this->initMailPart($mail, $mailStructure, 0);
+			$this->initMailPart($mail, $mailStructure, 0, $markAsSeen);
 		}
 		else {
 			foreach($mailStructure->parts as $partNum => $partStructure) {
-				$this->initMailPart($mail, $partStructure, $partNum + 1);
+				$this->initMailPart($mail, $partStructure, $partNum + 1, $markAsSeen);
 			}
+		}
+
+		if (!empty($mail->textHtml)) {
+			$mail->textPlain = Html2Text::convert($mail->textHtml);
 		}
 
 		return $mail;
 	}
 
-	protected function initMailPart(IncomingMail $mail, $partStructure, $partNum) {
-		$data = $partNum ? imap_fetchbody($this->getImapStream(), $mail->id, $partNum, FT_UID) : imap_body($this->getImapStream(), $mail->id, FT_UID);
+	protected function initMailPart(IncomingMail $mail, $partStructure, $partNum, $markAsSeen = true) {
+        $options = FT_UID;
+        if(!$markAsSeen) {
+            $options |= FT_PEEK;
+        }
+		$data = $partNum ? imap_fetchbody($this->getImapStream(), $mail->id, $partNum, $options) : imap_body($this->getImapStream(), $mail->id, $options);
 
-		if($partStructure->encoding == 1) {
+		/*if($partStructure->encoding == 1) {
 			$data = imap_utf8($data);
 		}
-		elseif($partStructure->encoding == 2) {
+		else*/if($partStructure->encoding == 2) {
 			$data = imap_binary($data);
 		}
 		elseif($partStructure->encoding == 3) {
+			$data = preg_replace('~[^a-zA-Z0-9+=/]+~s', '', $data); // https://github.com/barbushin/php-imap/issues/88
 			$data = imap_base64($data);
 		}
 		elseif($partStructure->encoding == 4) {
-			$data = imap_qprint($data);
+			$data = quoted_printable_decode($data);
 		}
 
 		$params = array();
@@ -485,61 +535,78 @@ class Mailbox {
 				}
 			}
 		}
-		if(!empty($params['charset'])) {
-			$data = $this->convertStringEncoding($data, $params['charset'], $this->serverEncoding);
-		}
 
-		// attachments
-		$attachmentId = $partStructure->ifid
-			? trim($partStructure->id, " <>")
-			: (isset($params['filename']) || isset($params['name']) ? mt_rand() . mt_rand() : null);
-		if($attachmentId) {
-			if(empty($params['filename']) && empty($params['name'])) {
-				$fileName = $attachmentId . '.' . strtolower($partStructure->subtype);
+		//if($partStructure->type == 0 && (!isset($partStructure->disposition) || $partStructure->disposition !== 'ATTACHMENT') && $data) {
+		if($partStructure->type == 0 && (!isset($partStructure->disposition) || ($partStructure->disposition !== 'ATTACHMENT' && $partStructure->disposition !== 'attachment')) && $data) {
+			if(!empty($params['charset'])) {
+				$data = $this->convertStringEncoding($data, $params['charset'], $this->serverEncoding);
 			}
-			else {
-				$fileName = !empty($params['filename']) ? $params['filename'] : $params['name'];
-				$fileName = $this->decodeMimeStr($fileName, $this->serverEncoding);
-				$fileName = $this->decodeRFC2231($fileName, $this->serverEncoding);
-			}
-			$attachment = new IncomingMailAttachment();
-			$attachment->id = $attachmentId;
-			$attachment->name = $fileName;
-			if($this->attachmentsDir) {
-				$replace = array(
-					'/\s/' => '_',
-					'/[^0-9a-zа-яіїє_\.]/iu' => '',
-					'/_+/' => '_',
-					'/(^_)|(_$)/' => '',
-				);
-				$fileSysName = preg_replace('~[\\\\/]~', '', $mail->id . '_' . $attachmentId . '_' . preg_replace(array_keys($replace), $replace, $fileName));
-				$attachment->filePath = $this->attachmentsDir . DIRECTORY_SEPARATOR . $fileSysName;
-				file_put_contents($attachment->filePath, $data);
-			}
-			$mail->addAttachment($attachment);
-		}
-		elseif($partStructure->type == 0 && $data) {
 			if(strtolower($partStructure->subtype) == 'plain') {
 				$mail->textPlain .= $data;
 			}
 			else {
 				$mail->textHtml .= $data;
 			}
+		} else {
+			// attachments
+			$attachmentId = $partStructure->ifid
+					? trim($partStructure->id, " <>")
+					: (isset($params['filename']) || isset($params['name']) ? mt_rand() . mt_rand() : null);
+
+			if($attachmentId) {
+				if(empty($params['filename']) && empty($params['name'])) {
+					$fileName = $attachmentId . '.' . strtolower($partStructure->subtype);
+				}
+				else {
+					$fileName = !empty($params['filename']) ? $params['filename'] : $params['name'];
+					$fileName = $this->decodeMimeStr($fileName, $this->serverEncoding);
+					$fileName = $this->decodeRFC2231($fileName, $this->serverEncoding);
+				}
+				$attachment = new IncomingMailAttachment();
+				$attachment->id = $attachmentId;
+				$attachment->name = $fileName;
+				if($this->attachmentsDir) {
+					$replace = array(
+							'/\s/' => '_',
+							'/[^0-9a-zа-яіїє_\.]/iu' => '',
+							'/_+/' => '_',
+							'/(^_)|(_$)/' => '',
+					);
+					$fileSysName = preg_replace('~[\\\\/]~', '', $mail->id . '_' . $attachmentId . '_' . preg_replace(array_keys($replace), $replace, $fileName));
+					$attachment->filePath = $this->attachmentsDir . DIRECTORY_SEPARATOR . $fileSysName;
+					file_put_contents($attachment->filePath, $data);
+				}
+				$mail->addAttachment($attachment);
+			}
 		}
-		elseif($partStructure->type == 2 && $data) {
-			$mail->textPlain .= trim($data);
-		}
+
 		if(!empty($partStructure->parts)) {
 			foreach($partStructure->parts as $subPartNum => $subPartStructure) {
 				if($partStructure->type == 2 && $partStructure->subtype == 'RFC822') {
-					$this->initMailPart($mail, $subPartStructure, $partNum);
+					$this->initMailPart($mail, $subPartStructure, $partNum, $markAsSeen);
 				}
 				else {
-					$this->initMailPart($mail, $subPartStructure, $partNum . '.' . ($subPartNum + 1));
+					$this->initMailPart($mail, $subPartStructure, $partNum . '.' . ($subPartNum + 1), $markAsSeen);
 				}
 			}
 		}
 	}
+
+    protected function detect_winencoding($string)
+    {
+		//incorrect win1251 detecting. remove
+		return null;
+
+        static $list = array('windows-1251');
+
+        foreach ($list as $item) {
+            $sample = iconv($item, $item, $string);
+            if (md5($sample) == md5($string)) {
+                return $item;
+            }
+        }
+        return null;
+    }
 
 	protected function decodeMimeStr($string, $charset = 'utf-8') {
 		$newString = '';
@@ -548,6 +615,7 @@ class Mailbox {
 			if($elements[$i]->charset == 'default') {
 				$elements[$i]->charset = 'iso-8859-1';
 			}
+
 			$newString .= $this->convertStringEncoding($elements[$i]->text, $elements[$i]->charset, $charset);
 		}
 		return $newString;
@@ -578,13 +646,25 @@ class Mailbox {
 	 * @return string Converted string if conversion was successful, or the original string if not
 	 */
 	protected function convertStringEncoding($string, $fromEncoding, $toEncoding) {
-		$convertedString = null;
+
+		if( $fromEncoding=='iso-8859-1' && $from = $this->detect_winencoding($string)){
+            return mb_convert_encoding($string, "UTF-8", $from); //windows-1251
+        }
+
+        $convertedString = null;
 		if($string && $fromEncoding != $toEncoding) {
-			$convertedString = @iconv($fromEncoding, $toEncoding . '//IGNORE', $string);
-			if(!$convertedString && extension_loaded('mbstring')) {
+		    if(function_exists('iconv')){
+                $convertedString = @iconv($fromEncoding, $toEncoding . '//IGNORE', $string);
+            }
+
+            if(!$convertedString && extension_loaded('mbstring')) {
 				$convertedString = @mb_convert_encoding($string, $toEncoding, $fromEncoding);
 			}
+
+			if(!$convertedString)
+			    throw new Exception('Can\'t convert string - please install mbstring or iconv');
 		}
+
 		return $convertedString ?: $string;
 	}
 
